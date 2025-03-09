@@ -1,2 +1,3 @@
 *.o
-spectre_v2
+spectre_v2_alias
+spectre_v2_self
