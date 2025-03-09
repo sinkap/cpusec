@@ -2,7 +2,7 @@
 CC = clang
 
 # Compiler flags
-CFLAGS = -Wall -O0
+CFLAGS = -Wall -O0 -g
 
 # Source files and executables
 SRC = $(wildcard *.c)

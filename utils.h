@@ -7,6 +7,15 @@
 #define xstr(s) str(s)
 
 #define NOP asm volatile("nop")
+#define NOPS_str(n) ".rept " xstr(n) "\n\t"\
+    "nop\n\t"\
+    ".endr\n\t"
+
+
+#define str(s) #s
+#define xstr(s) str(s)
+
+#define NOP asm volatile("nop")
 #define NOPS_str(n)                                                            \
   ".rept " xstr(n) "\n\t"                                                      \
                    "nop\n\t"                                                   \

