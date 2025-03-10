@@ -122,3 +122,13 @@ static inline void set_cpu_affinity(int cpu) {
     CPU_SET(cpu, &set);
     sched_setaffinity(0, sizeof(set), &set);
 }
+
+static inline __attribute__((always_inline)) void flush_range(long start, long stride, int n) {
+  asm("mfence");
+  for (uint64_t k = 0; k < n; ++k) {
+      volatile void *p = (uint8_t *)start + k * stride;
+      __asm__ volatile("clflushopt (%0)\n"::"r"(p));
+      __asm__ volatile("clflushopt (%0)\n"::"r"(p));
+  }
+  asm("lfence");
+}
