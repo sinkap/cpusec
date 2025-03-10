@@ -29,6 +29,7 @@
 #define PG_ROUND(n) (((((n) - 1UL) >> 12) + 1) << 12)
 
 /*
+ * (generated)
  * Calculates the Branch Target Buffer (BTB) index for a given address on AMD Zen 2 processors.
  * This function implements the reverse-engineered hash function used by Zen 2 to map
  * instruction addresses to BTB entries.  A collision in this hash function (different
@@ -121,14 +122,4 @@ static inline void set_cpu_affinity(int cpu) {
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     sched_setaffinity(0, sizeof(set), &set);
-}
-
-static inline __attribute__((always_inline)) void flush_range(long start, long stride, int n) {
-  asm("mfence");
-  for (uint64_t k = 0; k < n; ++k) {
-      volatile void *p = (uint8_t *)start + k * stride;
-      __asm__ volatile("clflushopt (%0)\n"::"r"(p));
-      __asm__ volatile("clflushopt (%0)\n"::"r"(p));
-  }
-  asm("lfence");
 }
